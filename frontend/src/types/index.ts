@@ -37,3 +37,21 @@ export interface FEAResult {
   maxStress: number;
   reactionForces: { nodeId: number; fx: number; fy: number }[];
 }
+
+export type HeatmapMode = 'stress' | 'strain' | 'force';
+
+export type CompareMode = 'overlay' | 'sideBySide';
+
+/**
+ * 一次分析开始时留存的结果快照：
+ * 完整保存当时的划分（节点/单元）、载荷与求解结果，颜色分布可据此按任意热力图模式重现。
+ */
+export interface Snapshot {
+  id: string;
+  seq: number;                 // 自增序号，便于辨认
+  createdAt: number;           // 时间戳
+  presetName: string;
+  heatmapMode: HeatmapMode;    // 生成快照时选用的热力图模式
+  model: FEAModel;
+  result: FEAResult;
+}
