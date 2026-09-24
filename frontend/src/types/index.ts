@@ -37,3 +37,15 @@ export interface FEAResult {
   maxStress: number;
   reactionForces: { nodeId: number; fx: number; fy: number }[];
 }
+
+export type HeatmapMode = 'stress' | 'strain' | 'force';
+
+// Immutable record captured every time an analysis is run
+export interface Snapshot {
+  id: string;
+  createdAt: number;                  // epoch ms
+  preset: string;                     // preset key used at solve time
+  heatmapMode: HeatmapMode;           // color distribution captured with the result
+  model: FEAModel;                    // frozen mesh (partitioning + loads)
+  result: FEAResult;                  // frozen per-element values & displacement extrema
+}

@@ -1,45 +1,41 @@
 <script setup lang="ts">
 import { ref, onMounted, watch, nextTick } from 'vue';
-import { useFEAStore } from '../store/fea';
+import { useFEAStore, metricValues } from '../store/fea';
+import type { Snapshot } from '../types';
 
 const store = useFEAStore();
 const canvas = ref<HTMLCanvasElement>();
 
-let offsetX = 50;
-let offsetY = 50;
 let scale = 1;
 let isDragging = false;
 let lastMouse = { x: 0, y: 0 };
 
-function worldToScreen(x: number, y: number): [number, number] {
-  return [x * scale + offsetX, y * scale + offsetY];
+interface Transform {
+  drawScale: number;
+  drawOffsetX: number;
+  drawOffsetY: number;
 }
 
-function screenToWorld(sx: number, sy: number): [number, number] {
-  return [(sx - offsetX) / scale, (sy - offsetY) / scale];
+interface Bounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
 }
 
-function draw() {
-  const ctx = canvas.value?.getContext('2d');
-  if (!ctx) return;
+interface DrawOptions {
+  colorFor?: (elementId: number) => string;
+  deformed?: boolean;                 // draw the dashed displaced mesh
+  deformTint?: string;
+  deformDash?: number[];
+  elementOpacity?: number;
+  elementDash?: number[];
+  selectable?: boolean;               // honor store.selectedElement
+  drawNodes?: boolean;
+  drawLoads?: boolean;
+}
 
-  const W = canvas.value!.width;
-  const H = canvas.value!.height;
-
-  ctx.clearRect(0, 0, W, H);
-  ctx.fillStyle = '#0f172a';
-  ctx.fillRect(0, 0, W, H);
-
-  const { nodes, elements, loads } = store.model;
-  if (nodes.length === 0) {
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = '14px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('选择一个预设模型开始分析', W / 2, H / 2);
-    return;
-  }
-
-  // Auto-scale to fit
+function boundsOf(nodes: { x: number; y: number }[]): Bounds {
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   for (const n of nodes) {
     minX = Math.min(minX, n.x);
@@ -47,78 +43,109 @@ function draw() {
     minY = Math.min(minY, n.y);
     maxY = Math.max(maxY, n.y);
   }
-  const worldW = maxX - minX || 1;
-  const worldH = maxY - minY || 1;
-  const margin = 60;
-  const fitScale = Math.min((W - margin * 2) / worldW, (H - margin * 2) / worldH);
+  return { minX, maxX, minY, maxY };
+}
 
-  // Use auto scale only if no manual zoom
-  const drawScale = fitScale * scale;
-  const drawOffsetX = margin - minX * drawScale + (W - margin * 2 - worldW * drawScale) / 2;
-  const drawOffsetY = margin - minY * drawScale + (H - margin * 2 - worldH * drawScale) / 2;
+function fitTransform(b: Bounds, x: number, y: number, w: number, h: number): Transform {
+  const margin = 40;
+  const worldW = b.maxX - b.minX || 1;
+  const worldH = b.maxY - b.minY || 1;
+  const fit = Math.min(
+    Math.max(1, w - margin * 2) / worldW,
+    Math.max(1, h - margin * 2) / worldH
+  );
+  const drawScale = fit * scale;
+  return {
+    drawScale,
+    drawOffsetX: x + margin - b.minX * drawScale + (w - margin * 2 - worldW * drawScale) / 2,
+    drawOffsetY: y + margin - b.minY * drawScale + (h - margin * 2 - worldH * drawScale) / 2,
+  };
+}
 
-  function toScreen(x: number, y: number): [number, number] {
-    return [x * drawScale + drawOffsetX, y * drawScale + drawOffsetY];
-  }
+function toScreen(t: Transform, x: number, y: number): [number, number] {
+  return [x * t.drawScale + t.drawOffsetX, y * t.drawScale + t.drawOffsetY];
+}
 
-  // Draw elements with heatmap colors
+// ─── Scene pieces ───────────────────────────────────────────────────────────
+
+function drawElements(
+  ctx: CanvasRenderingContext2D,
+  snap: Snapshot,
+  t: Transform,
+  opts: DrawOptions
+) {
+  const { nodes, elements } = snap.model;
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+
+  if (opts.elementOpacity !== undefined) ctx.globalAlpha = opts.elementOpacity;
+  if (opts.elementDash) ctx.setLineDash(opts.elementDash);
+
   for (const el of elements) {
-    const n1 = nodes.find((n) => n.id === el.nodeIds[0]);
-    const n2 = nodes.find((n) => n.id === el.nodeIds[1]);
+    const n1 = nodeById.get(el.nodeIds[0]);
+    const n2 = nodeById.get(el.nodeIds[1]);
     if (!n1 || !n2) continue;
 
-    const [x1, y1] = toScreen(n1.x, n1.y);
-    const [x2, y2] = toScreen(n2.x, n2.y);
-    const color = store.elementColors.get(el.id) || '#6b7280';
-    const isSelected = store.selectedElement === el.id;
+    const [x1, y1] = toScreen(t, n1.x, n1.y);
+    const [x2, y2] = toScreen(t, n2.x, n2.y);
+    const isSelected = opts.selectable && store.selectedElement === el.id;
 
     ctx.beginPath();
     ctx.moveTo(x1, y1);
     ctx.lineTo(x2, y2);
-    ctx.strokeStyle = color;
+    ctx.strokeStyle = opts.colorFor ? opts.colorFor(el.id) : '#6b7280';
     ctx.lineWidth = isSelected ? 4 : 2.5;
     ctx.stroke();
 
     if (isSelected) {
+      ctx.setLineDash([4, 3]);
       ctx.strokeStyle = '#ffffff';
       ctx.lineWidth = 1;
-      ctx.setLineDash([4, 3]);
       ctx.beginPath();
       ctx.moveTo(x1, y1);
       ctx.lineTo(x2, y2);
       ctx.stroke();
-      ctx.setLineDash([]);
+      ctx.setLineDash(opts.elementDash ?? []);
     }
   }
 
-  // Draw deformed mesh
-  if (store.showDeformed && store.result) {
-    ctx.setLineDash([5, 3]);
-    for (const el of elements) {
-      const n1 = nodes.find((n) => n.id === el.nodeIds[0]);
-      const n2 = nodes.find((n) => n.id === el.nodeIds[1]);
-      if (!n1 || !n2) continue;
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+}
 
-      const s = store.deformationScale;
-      const [x1, y1] = toScreen(n1.x + n1.displacementX * s, n1.y + n1.displacementY * s);
-      const [x2, y2] = toScreen(n2.x + n2.displacementX * s, n2.y + n2.displacementY * s);
+function drawDeformed(
+  ctx: CanvasRenderingContext2D,
+  snap: Snapshot,
+  t: Transform,
+  opts: DrawOptions
+) {
+  const { nodes, elements } = snap.model;
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  const s = store.deformationScale;
 
-      ctx.beginPath();
-      ctx.moveTo(x1, y1);
-      ctx.lineTo(x2, y2);
-      ctx.strokeStyle = 'rgba(251,191,36,0.5)';
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-    }
-    ctx.setLineDash([]);
+  ctx.setLineDash(opts.deformDash ?? [5, 3]);
+  for (const el of elements) {
+    const n1 = nodeById.get(el.nodeIds[0]);
+    const n2 = nodeById.get(el.nodeIds[1]);
+    if (!n1 || !n2) continue;
+
+    const [x1, y1] = toScreen(t, n1.x + n1.displacementX * s, n1.y + n1.displacementY * s);
+    const [x2, y2] = toScreen(t, n2.x + n2.displacementX * s, n2.y + n2.displacementY * s);
+
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.strokeStyle = opts.deformTint ?? 'rgba(251,191,36,0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
   }
+  ctx.setLineDash([]);
+}
 
-  // Draw nodes
-  for (const node of nodes) {
-    const [x, y] = toScreen(node.x, node.y);
+function drawNodes(ctx: CanvasRenderingContext2D, snap: Snapshot, t: Transform, tint?: string) {
+  for (const node of snap.model.nodes) {
+    const [x, y] = toScreen(t, node.x, node.y);
 
     if (node.fixed) {
-      // Draw triangle for fixed nodes
       ctx.beginPath();
       ctx.moveTo(x, y - 8);
       ctx.lineTo(x - 6, y + 4);
@@ -130,7 +157,6 @@ function draw() {
       ctx.lineWidth = 1.5;
       ctx.stroke();
 
-      // Hatching below
       ctx.strokeStyle = '#f97316';
       ctx.lineWidth = 1;
       for (let i = -8; i <= 8; i += 4) {
@@ -142,19 +168,21 @@ function draw() {
     } else {
       ctx.beginPath();
       ctx.arc(x, y, 4, 0, Math.PI * 2);
-      ctx.fillStyle = '#e2e8f0';
+      ctx.fillStyle = tint ?? '#e2e8f0';
       ctx.fill();
       ctx.strokeStyle = '#64748b';
       ctx.lineWidth = 1;
       ctx.stroke();
     }
   }
+}
 
-  // Draw load arrows
-  for (const load of loads) {
-    const node = nodes.find((n) => n.id === load.nodeId);
+function drawLoads(ctx: CanvasRenderingContext2D, snap: Snapshot, t: Transform) {
+  const nodeById = new Map(snap.model.nodes.map((n) => [n.id, n]));
+  for (const load of snap.model.loads) {
+    const node = nodeById.get(load.nodeId);
     if (!node) continue;
-    const [x, y] = toScreen(node.x, node.y);
+    const [x, y] = toScreen(t, node.x, node.y);
 
     const mag = Math.sqrt(load.fx ** 2 + load.fy ** 2);
     if (mag === 0) continue;
@@ -163,7 +191,6 @@ function draw() {
     const dx = (load.fx / mag) * arrowLen;
     const dy = (load.fy / mag) * arrowLen;
 
-    // Arrow line
     ctx.beginPath();
     ctx.moveTo(x - dx, y - dy);
     ctx.lineTo(x, y);
@@ -171,7 +198,6 @@ function draw() {
     ctx.lineWidth = 2.5;
     ctx.stroke();
 
-    // Arrow head
     const headLen = 8;
     const angle = Math.atan2(dy, dx);
     ctx.beginPath();
@@ -183,18 +209,37 @@ function draw() {
     ctx.lineWidth = 2;
     ctx.stroke();
 
-    // Label
     ctx.fillStyle = '#fca5a5';
     ctx.font = '10px sans-serif';
     ctx.textAlign = 'center';
     ctx.fillText(`${(mag / 1000).toFixed(1)}kN`, x - dx / 2, y - dy / 2 - 6);
   }
+}
 
-  // Draw color legend bar
-  const legendX = W - 40;
+function drawScene(
+  ctx: CanvasRenderingContext2D,
+  snap: Snapshot,
+  t: Transform,
+  opts: DrawOptions
+) {
+  drawElements(ctx, snap, t, opts);
+  if (opts.deformed) drawDeformed(ctx, snap, t, opts);
+  if (opts.drawNodes !== false) drawNodes(ctx, snap, t);
+  if (opts.drawLoads !== false) drawLoads(ctx, snap, t);
+}
+
+function drawLegend(
+  ctx: CanvasRenderingContext2D,
+  W: number,
+  H: number,
+  maxVal: number,
+  minVal: number,
+  subtitle: string
+) {
+  const legendX = W - 36;
   const legendY = 30;
   const legendH = H - 60;
-  const legendW = 15;
+  const legendW = 14;
 
   const gradient = ctx.createLinearGradient(0, legendY, 0, legendY + legendH);
   gradient.addColorStop(0, 'rgb(255,0,0)');
@@ -209,43 +254,286 @@ function draw() {
   ctx.lineWidth = 1;
   ctx.strokeRect(legendX, legendY, legendW, legendH);
 
-  // Legend labels
-  ctx.fillStyle = '#94a3b8';
-  ctx.font = '10px sans-serif';
-  ctx.textAlign = 'left';
-
-  let maxVal = 0, minVal = 0;
-  if (store.result) {
-    switch (store.heatmapMode) {
-      case 'stress':
-        maxVal = Math.max(...store.result.stresses.map(Math.abs));
-        break;
-      case 'strain':
-        maxVal = Math.max(...store.result.strains.map(Math.abs));
-        break;
-      case 'force':
-        maxVal = Math.max(...elements.map((e) => Math.abs(e.force)));
-        break;
-    }
-  }
-
   const unit = store.heatmapMode === 'stress' ? 'MPa' :
     store.heatmapMode === 'strain' ? '%' : 'kN';
 
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '10px sans-serif';
   ctx.textAlign = 'right';
   ctx.fillText(`${maxVal.toExponential(1)} ${unit}`, legendX - 4, legendY + 8);
-  ctx.fillText('0', legendX - 4, legendY + legendH);
+  ctx.fillText(`${minVal.toExponential(1)} ${unit}`, legendX - 4, legendY + legendH);
 
-  // Mode label
   ctx.save();
-  ctx.translate(legendX + legendW + 10, legendY + legendH / 2);
+  ctx.translate(legendX + legendW + 11, legendY + legendH / 2);
   ctx.rotate(-Math.PI / 2);
   ctx.textAlign = 'center';
   ctx.fillStyle = '#64748b';
   ctx.font = '11px sans-serif';
   ctx.fillText(store.heatmapMode.toUpperCase(), 0, 0);
   ctx.restore();
+
+  if (subtitle) {
+    ctx.save();
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(subtitle, legendX - 4, legendY - 12);
+    ctx.restore();
+  }
 }
+
+function drawRegionHeader(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  tag: string,
+  tagColor: string,
+  snap: Snapshot
+) {
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 12px sans-serif';
+  ctx.fillStyle = tagColor;
+  ctx.fillText(tag, x + 8, y + 16);
+  ctx.font = '10px sans-serif';
+  ctx.fillStyle = '#94a3b8';
+  ctx.fillText(
+    `位移 ${(snap.result.maxDisplacement * 1000).toFixed(3)}mm · ` +
+      `应力 ${(snap.result.maxStress / 1e6).toFixed(2)}MPa`,
+    x + 30,
+    y + 16
+  );
+}
+
+// ─── Views ──────────────────────────────────────────────────────────────────
+
+function drawEmptyModel(ctx: CanvasRenderingContext2D, W: number, H: number) {
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '14px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('选择一个预设模型开始分析', W / 2, H / 2);
+}
+
+function drawLive(ctx: CanvasRenderingContext2D, W: number, H: number) {
+  const { nodes, elements } = store.model;
+  if (nodes.length === 0) {
+    drawEmptyModel(ctx, W, H);
+    return;
+  }
+
+  // Same auto-fit behaviour as before
+  const b = boundsOf(nodes);
+  const t = fitTransform(b, 0, 0, W, H);
+
+  const fakeSnap: Snapshot = {
+    id: 'live',
+    createdAt: 0,
+    preset: store.selectedPreset,
+    heatmapMode: store.heatmapMode,
+    model: store.model,
+    result: store.result!,
+  };
+
+  drawScene(ctx, fakeSnap, t, {
+    colorFor: (id) => store.elementColors.get(id) || '#6b7280',
+    deformed: store.showDeformed && !!store.result,
+    selectable: true,
+  });
+
+  let maxVal = 0;
+  let minVal = 0;
+  if (store.result) {
+    const values = metricValues(store.result, store.model, store.heatmapMode);
+    maxVal = Math.max(...values);
+    minVal = Math.min(...values);
+  }
+  drawLegend(ctx, W, H, maxVal, minVal, '');
+}
+
+function drawCompareEmpty(ctx: CanvasRenderingContext2D, W: number, H: number) {
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '14px sans-serif';
+  ctx.textAlign = 'center';
+  if (store.snapshots.length === 0) {
+    ctx.fillText('还没有结果快照', W / 2, H / 2 - 22);
+    ctx.font = '12px sans-serif';
+    ctx.fillStyle = '#64748b';
+    ctx.fillText('运行一次「求解 FEA」，快照会自动保存', W / 2, H / 2 + 4);
+  } else if (store.snapshots.length === 1) {
+    ctx.fillText('只有一份快照，暂时无法比对', W / 2, H / 2 - 22);
+    ctx.font = '12px sans-serif';
+    ctx.fillStyle = '#64748b';
+    ctx.fillText('调整参数后再次求解，即可得到两份结果', W / 2, H / 2 + 4);
+  } else {
+    ctx.fillText('请在右侧快照列表中为 A、B 各选一份快照', W / 2, H / 2 - 10);
+  }
+}
+
+function drawSideBySide(ctx: CanvasRenderingContext2D, W: number, H: number) {
+  const A = store.snapA;
+  const B = store.snapB;
+  if (!A || !B || !store.canCompare) {
+    drawCompareEmpty(ctx, W, H);
+    return;
+  }
+
+  const legendW = 52;
+  const panelW = (W - legendW) / 2;
+
+  // Common fit scale derived from both meshes so geometry sizes line up;
+  // each panel keeps its own centering offsets.
+  const bA = boundsOf(A.model.nodes);
+  const bB = boundsOf(B.model.nodes);
+  const union: Bounds = {
+    minX: Math.min(bA.minX, bB.minX),
+    maxX: Math.max(bA.maxX, bB.maxX),
+    minY: Math.min(bA.minY, bB.minY),
+    maxY: Math.max(bA.maxY, bB.maxY),
+  };
+  const shared = fitTransform(union, 0, 0, panelW, H);
+  const reOffset = (b: Bounds, px: number): Transform => {
+    const margin = 40;
+    const worldW = b.maxX - b.minX || 1;
+    const worldH = b.maxY - b.minY || 1;
+    return {
+      drawScale: shared.drawScale,
+      drawOffsetX: px + margin - b.minX * shared.drawScale +
+        (panelW - margin * 2 - worldW * shared.drawScale) / 2,
+      drawOffsetY: margin - b.minY * shared.drawScale +
+        (H - margin * 2 - worldH * shared.drawScale) / 2,
+    };
+  };
+  const ttA = reOffset(bA, 0);
+  const ttB = reOffset(bB, panelW);
+
+  const colorFor = (snap: Snapshot) => (id: number) => store.colorForSnapshot(snap, id);
+  const deformed = store.showDeformed;
+
+  // Clip each panel so models stay inside their own region
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, panelW, H);
+  ctx.clip();
+  drawScene(ctx, A, ttA, {
+    colorFor: colorFor(A),
+    deformed,
+    deformTint: 'rgba(251,191,36,0.7)',
+  });
+  ctx.restore();
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(panelW, 0, panelW, H);
+  ctx.clip();
+  drawScene(ctx, B, ttB, {
+    colorFor: colorFor(B),
+    deformed,
+    deformTint: 'rgba(34,211,238,0.7)',
+  });
+  ctx.restore();
+
+  // Divider
+  ctx.strokeStyle = '#334155';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  ctx.moveTo(panelW, 10);
+  ctx.lineTo(panelW, H - 10);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  drawRegionHeader(ctx, 0, 0, 'A', '#fbbf24', A);
+  drawRegionHeader(ctx, panelW, 0, 'B', '#22d3ee', B);
+
+  // One shared legend for both panels
+  const { min, max } = store.compareColorRange;
+  drawLegend(ctx, W, H, max, min, 'A / B 共用刻度');
+}
+
+function drawOverlay(ctx: CanvasRenderingContext2D, W: number, H: number) {
+  const A = store.snapA;
+  const B = store.snapB;
+  if (!A || !B || !store.canCompare) {
+    drawCompareEmpty(ctx, W, H);
+    return;
+  }
+
+  const legendW = 52;
+  const areaW = W - legendW;
+  const bA = boundsOf(A.model.nodes);
+  const bB = boundsOf(B.model.nodes);
+  const union: Bounds = {
+    minX: Math.min(bA.minX, bB.minX),
+    maxX: Math.max(bA.maxX, bB.maxX),
+    minY: Math.min(bA.minY, bB.minY),
+    maxY: Math.max(bA.maxY, bB.maxY),
+  };
+  const t = fitTransform(union, 0, 0, areaW, H);
+  const deformed = store.showDeformed;
+
+  // A: solid colored elements; B: dashed colored elements so both partitions show
+  drawScene(ctx, A, t, {
+    colorFor: (id) => store.colorForSnapshot(A, id),
+    deformed,
+    deformTint: 'rgba(251,191,36,0.85)',
+    elementOpacity: 0.9,
+    drawLoads: false,
+  });
+  drawScene(ctx, B, t, {
+    colorFor: (id) => store.colorForSnapshot(B, id),
+    deformed,
+    deformTint: 'rgba(34,211,238,0.85)',
+    deformDash: [5, 3],
+    elementOpacity: 0.55,
+    elementDash: [7, 4],
+    drawNodes: false,
+    drawLoads: false,
+  });
+  // B nodes on top (cyan, open circles)
+  drawNodes(ctx, B, t, '#67e8f9');
+  // Loads from A only (reference), drawn last so arrows stay visible
+  drawLoads(ctx, A, t);
+
+  // Overlay key
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 12px sans-serif';
+  ctx.fillStyle = '#fbbf24';
+  ctx.fillText('A', 10, 18);
+  ctx.fillStyle = '#22d3ee';
+  ctx.fillText('B', 30, 18);
+  ctx.font = '10px sans-serif';
+  ctx.fillStyle = '#94a3b8';
+  ctx.fillText(
+    `A 位移 ${(A.result.maxDisplacement * 1000).toFixed(3)}mm  ·  ` +
+      `B 位移 ${(B.result.maxDisplacement * 1000).toFixed(3)}mm`,
+    48,
+    18
+  );
+
+  const { min, max } = store.compareColorRange;
+  drawLegend(ctx, W, H, max, min, 'A / B 共用刻度');
+}
+
+// ─── Main render ────────────────────────────────────────────────────────────
+function draw() {
+  const ctx = canvas.value?.getContext('2d');
+  if (!ctx) return;
+
+  const W = canvas.value!.width;
+  const H = canvas.value!.height;
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0f172a';
+  ctx.fillRect(0, 0, W, H);
+
+  if (store.comparisonOpen) {
+    if (store.comparisonMode === 'overlay') drawOverlay(ctx, W, H);
+    else drawSideBySide(ctx, W, H);
+  } else {
+    drawLive(ctx, W, H);
+  }
+}
+
+// ─── Interaction ────────────────────────────────────────────────────────────
 
 function handleMouseDown(e: MouseEvent) {
   isDragging = true;
@@ -254,8 +542,6 @@ function handleMouseDown(e: MouseEvent) {
 
 function handleMouseMove(e: MouseEvent) {
   if (!isDragging) return;
-  offsetX += e.clientX - lastMouse.x;
-  offsetY += e.clientY - lastMouse.y;
   lastMouse = { x: e.clientX, y: e.clientY };
   draw();
 }
@@ -267,57 +553,44 @@ function handleMouseUp() {
 function handleWheel(e: WheelEvent) {
   e.preventDefault();
   const factor = e.deltaY > 0 ? 0.9 : 1.1;
-  scale *= factor;
-  scale = Math.max(0.1, Math.min(10, scale));
+  scale = Math.max(0.1, Math.min(10, scale * factor));
   draw();
 }
 
 function handleClick(e: MouseEvent) {
+  // Element picking only applies to the live (current result) view.
+  if (store.comparisonOpen || !store.result || store.model.nodes.length === 0) return;
+
   const rect = canvas.value!.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
+  const mx = (e.clientX - rect.left) * (canvas.value!.width / rect.width);
+  const my = (e.clientY - rect.top) * (canvas.value!.height / rect.height);
 
   const { nodes, elements } = store.model;
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const n of nodes) {
-    minX = Math.min(minX, n.x);
-    maxX = Math.max(maxX, n.x);
-    minY = Math.min(minY, n.y);
-    maxY = Math.max(maxY, n.y);
-  }
-  const worldW = maxX - minX || 1;
-  const worldH = maxY - minY || 1;
+  const b = boundsOf(nodes);
   const W = canvas.value!.width;
   const H = canvas.value!.height;
-  const margin = 60;
-  const fitScale = Math.min((W - margin * 2) / worldW, (H - margin * 2) / worldH);
-  const drawScale = fitScale * scale;
-  const drawOffsetX = margin - minX * drawScale + (W - margin * 2 - worldW * drawScale) / 2;
-  const drawOffsetY = margin - minY * drawScale + (H - margin * 2 - worldH * drawScale) / 2;
+  const t = fitTransform(b, 0, 0, W, H);
 
-  // Find nearest element
   let bestDist = 15;
   let bestId: number | null = null;
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
 
   for (const el of elements) {
-    const n1 = nodes.find((n) => n.id === el.nodeIds[0]);
-    const n2 = nodes.find((n) => n.id === el.nodeIds[1]);
+    const n1 = nodeById.get(el.nodeIds[0]);
+    const n2 = nodeById.get(el.nodeIds[1]);
     if (!n1 || !n2) continue;
 
-    const x1 = n1.x * drawScale + drawOffsetX;
-    const y1 = n1.y * drawScale + drawOffsetY;
-    const x2 = n2.x * drawScale + drawOffsetX;
-    const y2 = n2.y * drawScale + drawOffsetY;
+    const [x1, y1] = toScreen(t, n1.x, n1.y);
+    const [x2, y2] = toScreen(t, n2.x, n2.y);
 
-    // Point-to-segment distance
     const dx = x2 - x1;
     const dy = y2 - y1;
     const len2 = dx * dx + dy * dy;
     if (len2 === 0) continue;
-    let t = ((mx - x1) * dx + (my - y1) * dy) / len2;
-    t = Math.max(0, Math.min(1, t));
-    const px = x1 + t * dx;
-    const py = y1 + t * dy;
+    let tt = ((mx - x1) * dx + (my - y1) * dy) / len2;
+    tt = Math.max(0, Math.min(1, tt));
+    const px = x1 + tt * dx;
+    const py = y1 + tt * dy;
     const dist = Math.sqrt((mx - px) ** 2 + (my - py) ** 2);
 
     if (dist < bestDist) {
@@ -343,6 +616,11 @@ watch(
     store.selectedElement,
     store.heatmapMode,
     store.elementColors,
+    store.comparisonOpen,
+    store.comparisonMode,
+    store.snapshots,
+    store.compareA,
+    store.compareB,
   ],
   () => nextTick(draw),
   { deep: true }
@@ -354,7 +632,8 @@ watch(
     ref="canvas"
     width="800"
     height="500"
-    class="w-full rounded-lg border border-slate-700 cursor-crosshair"
+    class="w-full rounded-lg border border-slate-700"
+    :class="store.comparisonOpen ? 'cursor-default' : 'cursor-crosshair'"
     @mousedown="handleMouseDown"
     @mousemove="handleMouseMove"
     @mouseup="handleMouseUp"

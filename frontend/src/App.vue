@@ -3,6 +3,7 @@ import { onMounted } from 'vue';
 import FEACanvas from './components/FEACanvas.vue';
 import ElementInfo from './components/ElementInfo.vue';
 import MeshControls from './components/MeshControls.vue';
+import SnapshotPanel from './components/SnapshotPanel.vue';
 import { useFEAStore } from './store/fea';
 
 const store = useFEAStore();
@@ -28,13 +29,32 @@ onMounted(() => {
     <!-- Main content -->
     <div class="flex flex-1 overflow-hidden">
       <!-- Canvas area -->
-      <div class="flex-1 p-3" style="width: 75%">
+      <div class="flex-1 p-3 flex flex-col gap-2" style="width: 75%">
+        <div
+          v-if="store.comparisonOpen && store.canCompare"
+          class="flex items-center justify-between rounded border border-purple-800 bg-purple-950/50 px-3 py-1.5 text-xs"
+        >
+          <span class="text-purple-300">
+            快照对比中 ·
+            <span class="text-amber-400 font-bold">A</span>
+            与
+            <span class="text-cyan-400 font-bold">B</span>
+            使用同一套颜色刻度（{{ store.comparisonMode === 'overlay' ? '叠加' : '并排' }}）
+          </span>
+          <button
+            @click="store.setComparisonOpen(false)"
+            class="text-slate-400 hover:text-slate-200 underline underline-offset-2"
+          >
+            返回当前结果
+          </button>
+        </div>
         <FEACanvas />
       </div>
 
       <!-- Right sidebar -->
       <div class="w-[25%] min-w-[260px] bg-slate-900 border-l border-slate-800 p-3 flex flex-col gap-3 overflow-y-auto">
         <MeshControls />
+        <SnapshotPanel />
         <ElementInfo />
       </div>
     </div>
@@ -54,6 +74,9 @@ onMounted(() => {
         </span>
       </span>
       <span>
+        快照数: <span class="text-slate-200">{{ store.snapshots.length }}</span>
+      </span>
+      <span>
         节点数: <span class="text-slate-200">{{ store.model.nodes.length }}</span>
       </span>
       <span>
@@ -65,3 +88,4 @@ onMounted(() => {
     </footer>
   </div>
 </template>
+
